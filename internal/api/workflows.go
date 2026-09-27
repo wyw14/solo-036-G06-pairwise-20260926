@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/wyw14/solo-036/internal/model"
 	"github.com/wyw14/solo-036/internal/service"
 	"github.com/wyw14/solo-036/internal/tracker"
 )
@@ -34,9 +35,20 @@ type trackRequest struct {
 	ObservedAt string  `json:"observed_at"`
 }
 
+type receivedPig struct {
+	PigID       string           `json:"pig_id"`
+	Crew        string           `json:"crew"`
+	CollectedBy string           `json:"collected_by"`
+	SealStatus  model.SealStatus `json:"seal_status"`
+	SealNo      string           `json:"seal_no"`
+	Location    string           `json:"location"`
+	Note        string           `json:"note"`
+}
+
 type receiveRequest struct {
-	StationID      string `json:"station_id"`
-	IsolationEpoch int64  `json:"isolation_epoch"`
+	StationID      string        `json:"station_id"`
+	IsolationEpoch int64         `json:"isolation_epoch"`
+	Pigs           []receivedPig `json:"pigs"`
 }
 
 type completeRequest struct {
@@ -169,9 +181,22 @@ func (h *Handler) Receive(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, err)
 		return
 	}
+	pigs := make([]service.ReceivedPigInput, 0, len(request.Pigs))
+	for _, pig := range request.Pigs {
+		pigs = append(pigs, service.ReceivedPigInput{
+			PigID:       pig.PigID,
+			Crew:        pig.Crew,
+			CollectedBy: pig.CollectedBy,
+			SealStatus:  pig.SealStatus,
+			SealNo:      pig.SealNo,
+			Location:    pig.Location,
+			Note:        pig.Note,
+		})
+	}
 	operation, err := h.runtime.Receive(chi.URLParam(r, "runID"), service.ReceiveRequest{
 		StationID:      request.StationID,
 		IsolationEpoch: request.IsolationEpoch,
+		Pigs:           pigs,
 	})
 	if err != nil {
 		writeError(w, r, http.StatusConflict, err)

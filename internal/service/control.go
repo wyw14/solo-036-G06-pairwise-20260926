@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wyw14/solo-036/internal/custody"
 	"github.com/wyw14/solo-036/internal/emergency"
 	"github.com/wyw14/solo-036/internal/journal"
 	"github.com/wyw14/solo-036/internal/launcher"
@@ -48,16 +49,29 @@ type TrackingRequest struct {
 }
 
 type ReceiveRequest struct {
-	StationID      string `json:"station_id"`
-	IsolationEpoch int64  `json:"isolation_epoch"`
+	StationID      string             `json:"station_id"`
+	IsolationEpoch int64              `json:"isolation_epoch"`
+	Pigs           []ReceivedPigInput `json:"pigs"`
+}
+
+type ReceivedPigInput struct {
+	PigID       string           `json:"pig_id"`
+	Crew        string           `json:"crew"`
+	CollectedBy string           `json:"collected_by"`
+	SealStatus  model.SealStatus `json:"seal_status"`
+	SealNo      string           `json:"seal_no"`
+	Location    string           `json:"location"`
+	Note        string           `json:"note"`
 }
 
 type RecoveryReport struct {
-	RecoveredRuns    int  `json:"recovered_runs"`
-	RecoveredRoutes  int  `json:"recovered_routes"`
-	RecoveredPermits int  `json:"recovered_permits"`
-	JournalEvents    int  `json:"journal_events"`
-	Ready            bool `json:"ready"`
+	RecoveredRuns        int  `json:"recovered_runs"`
+	RecoveredRoutes      int  `json:"recovered_routes"`
+	RecoveredPermits     int  `json:"recovered_permits"`
+	RecoveredCollections int  `json:"recovered_collections"`
+	RecoveredHandovers   int  `json:"recovered_handovers"`
+	JournalEvents        int  `json:"journal_events"`
+	Ready                bool `json:"ready"`
 }
 
 func defaultControlState() *ControlState {
@@ -433,6 +447,17 @@ func (r *Runtime) Receive(runID string, request ReceiveRequest) (model.Operation
 	}); err != nil {
 		return model.OperationRecord{}, err
 	}
+	for _, pig := range request.Pigs {
+		r.autoRegisterReceivedPig(runID, request.StationID, PigCollectionInput{
+			PigID:       pig.PigID,
+			Crew:        pig.Crew,
+			CollectedBy: pig.CollectedBy,
+			SealStatus:  pig.SealStatus,
+			SealNo:      pig.SealNo,
+			Location:    pig.Location,
+			Note:        pig.Note,
+		}, time.Now().UTC())
+	}
 	return r.Operation(runID)
 }
 
@@ -500,17 +525,19 @@ func (r *Runtime) Snapshot() model.ControlSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	snapshot := model.ControlSnapshot{
-		Revision:   control.Revision,
-		CapturedAt: time.Now().UTC(),
-		Stations:   make([]model.Station, 0, len(control.Stations)),
-		Valves:     make([]model.ValveState, 0, len(control.Valves)),
-		Closures:   make([]model.ClosureState, 0, len(control.Closures)),
-		Pressures:  make([]model.PressureState, 0, len(control.Pressures)),
-		Routes:     make([]model.RouteState, 0, len(control.Routes)),
-		Tracking:   make([]model.TrackingState, 0),
-		Permits:    make([]model.PermitState, 0),
-		Runs:       r.Runs.Snapshot(),
-		Incidents:  append([]model.Incident(nil), control.Incidents...),
+		Revision:    control.Revision,
+		CapturedAt:  time.Now().UTC(),
+		Stations:    make([]model.Station, 0, len(control.Stations)),
+		Valves:      make([]model.ValveState, 0, len(control.Valves)),
+		Closures:    make([]model.ClosureState, 0, len(control.Closures)),
+		Pressures:   make([]model.PressureState, 0, len(control.Pressures)),
+		Routes:      make([]model.RouteState, 0, len(control.Routes)),
+		Tracking:    make([]model.TrackingState, 0),
+		Permits:     make([]model.PermitState, 0),
+		Runs:        r.Runs.Snapshot(),
+		Incidents:   append([]model.Incident(nil), control.Incidents...),
+		Collections: r.Custody.Collections(),
+		Handovers:   r.Custody.Handovers(),
 	}
 	for _, value := range control.Stations {
 		snapshot.Stations = append(snapshot.Stations, value)
@@ -590,6 +617,11 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 		}
 	}
 	permit.Restore(r.Permits, permitEvents)
+	custodyStore, err := custody.Restore(snapshot.Control.Collections, snapshot.Control.Handovers)
+	if err != nil {
+		return RecoveryReport{}, err
+	}
+	r.Custody = custodyStore
 	r.mu.Lock()
 	r.control.Stations = snapshot.Control.StationIndex()
 	r.control.Routes = make(map[string]model.RouteState)
@@ -624,11 +656,13 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 		return RecoveryReport{}, err
 	}
 	return RecoveryReport{
-		RecoveredRuns:    len(snapshot.Control.Runs),
-		RecoveredRoutes:  len(leasing),
-		RecoveredPermits: len(permitEvents),
-		JournalEvents:    len(events),
-		Ready:            true,
+		RecoveredRuns:        len(snapshot.Control.Runs),
+		RecoveredRoutes:      len(leasing),
+		RecoveredPermits:     len(permitEvents),
+		RecoveredCollections: len(snapshot.Control.Collections),
+		RecoveredHandovers:   len(snapshot.Control.Handovers),
+		JournalEvents:        len(events),
+		Ready:                true,
 	}, nil
 }
 
@@ -705,6 +739,7 @@ func (r *Runtime) HealthDetails() map[string]any {
 	}
 	ready := validationError == nil && run.Health(r.Runs) && tracker.Ready(r.Tracker) && launcher.Ready(r.Launcher)
 	recoverySteps := NewRecoveryPlan().Steps()
+	reconcile := r.CustodyReconcile()
 	return map[string]any{
 		"status":              map[bool]string{true: "ok", false: "degraded"}[ready],
 		"ready":               ready,
@@ -719,6 +754,10 @@ func (r *Runtime) HealthDetails() map[string]any {
 		"pressure_samples":    len(r.Pressure.History()),
 		"recovery_steps":      recoverySteps,
 		"captured_at":         snapshot.CapturedAt,
+		"custody_pigs":        len(r.Custody.Chains()),
+		"custody_pending":     len(reconcile.Pending),
+		"custody_consistent":  reconcile.Consistent,
+		"custody_findings":    len(reconcile.Findings),
 	}
 }
 

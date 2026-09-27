@@ -99,26 +99,30 @@ type PermitState struct {
 }
 
 type OperationRecord struct {
-	Run       Run             `json:"run"`
-	Route     RouteState      `json:"route"`
-	Pressure  PressureState   `json:"pressure"`
-	Tracking  []TrackingState `json:"tracking"`
-	Permits   []PermitState   `json:"permits"`
-	LastError string          `json:"last_error,omitempty"`
+	Run        Run                `json:"run"`
+	Route      RouteState         `json:"route"`
+	Pressure   PressureState      `json:"pressure"`
+	Tracking   []TrackingState    `json:"tracking"`
+	Permits    []PermitState      `json:"permits"`
+	Collection []CollectionRecord `json:"collection"`
+	Handovers  []HandoverRecord   `json:"handovers"`
+	LastError  string             `json:"last_error,omitempty"`
 }
 
 type ControlSnapshot struct {
-	Revision   string          `json:"revision"`
-	CapturedAt time.Time       `json:"captured_at"`
-	Stations   []Station       `json:"stations"`
-	Valves     []ValveState    `json:"valves"`
-	Closures   []ClosureState  `json:"closures"`
-	Pressures  []PressureState `json:"pressures"`
-	Routes     []RouteState    `json:"routes"`
-	Tracking   []TrackingState `json:"tracking"`
-	Permits    []PermitState   `json:"permits"`
-	Runs       []Run           `json:"runs"`
-	Incidents  []Incident      `json:"incidents"`
+	Revision    string             `json:"revision"`
+	CapturedAt  time.Time          `json:"captured_at"`
+	Stations    []Station          `json:"stations"`
+	Valves      []ValveState       `json:"valves"`
+	Closures    []ClosureState     `json:"closures"`
+	Pressures   []PressureState    `json:"pressures"`
+	Routes      []RouteState       `json:"routes"`
+	Tracking    []TrackingState    `json:"tracking"`
+	Permits     []PermitState      `json:"permits"`
+	Runs        []Run              `json:"runs"`
+	Incidents   []Incident         `json:"incidents"`
+	Collections []CollectionRecord `json:"collections"`
+	Handovers   []HandoverRecord   `json:"handovers"`
 }
 
 func (s Station) Validate() error {
@@ -268,6 +272,20 @@ func (s ControlSnapshot) Validate() error {
 			return fmt.Errorf("permit %s: %w", permit.Name, err)
 		}
 	}
+	for _, collection := range s.Collections {
+		if err := collection.Validate(); err != nil {
+			return fmt.Errorf("collection %s: %w", collection.PigID, err)
+		}
+	}
+	handoversByPig := make(map[string][]HandoverRecord)
+	for _, handover := range s.Handovers {
+		handoversByPig[handover.PigID] = append(handoversByPig[handover.PigID], handover)
+	}
+	for pigID, chain := range handoversByPig {
+		if err := ValidateHandoverChain(chain); err != nil {
+			return fmt.Errorf("custody chain %s: %w", pigID, err)
+		}
+	}
 	return nil
 }
 
@@ -315,6 +333,18 @@ func (s ControlSnapshot) Operation(runID string) (OperationRecord, bool) {
 	for _, permit := range s.Permits {
 		if permit.RunID == runID {
 			result.Permits = append(result.Permits, permit)
+		}
+	}
+	pigByRun := make(map[string]bool)
+	for _, collection := range s.Collections {
+		if collection.RunID == runID {
+			result.Collection = append(result.Collection, collection)
+			pigByRun[collection.PigID] = true
+		}
+	}
+	for _, handover := range s.Handovers {
+		if pigByRun[handover.PigID] {
+			result.Handovers = append(result.Handovers, handover)
 		}
 	}
 	return result, true
