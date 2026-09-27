@@ -119,6 +119,8 @@ type ControlSnapshot struct {
 	Permits    []PermitState   `json:"permits"`
 	Runs       []Run           `json:"runs"`
 	Incidents  []Incident      `json:"incidents"`
+	Pigs       []Pig           `json:"pigs"`
+	Handovers  []Handover      `json:"handovers"`
 }
 
 func (s Station) Validate() error {
@@ -266,6 +268,99 @@ func (s ControlSnapshot) Validate() error {
 	for _, permit := range s.Permits {
 		if err := permit.Validate(); err != nil {
 			return fmt.Errorf("permit %s: %w", permit.Name, err)
+		}
+	}
+	if err := s.validateCustody(stations); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateCustody checks registered pigs and their handover chains:
+// uniqueness, referential integrity against runs/stations, at most one
+// pending handover per pig, gap-free sequences and chain continuity.
+func (s ControlSnapshot) validateCustody(stations map[string]Station) error {
+	runs := make(map[string]Run, len(s.Runs))
+	for _, run := range s.Runs {
+		runs[run.ID] = run
+	}
+	pigs := make(map[string]Pig, len(s.Pigs))
+	pigRuns := make(map[string]string, len(s.Pigs))
+	for _, pig := range s.Pigs {
+		if err := pig.Validate(); err != nil {
+			return fmt.Errorf("pig %s: %w", pig.Code, err)
+		}
+		if _, duplicate := pigs[pig.Code]; duplicate {
+			return fmt.Errorf("pig code %s is registered more than once", pig.Code)
+		}
+		if other, exists := pigRuns[pig.RunID]; exists {
+			return fmt.Errorf("run %s is registered for both pig %s and pig %s", pig.RunID, other, pig.Code)
+		}
+		pigRuns[pig.RunID] = pig.Code
+		run, ok := runs[pig.RunID]
+		if !ok {
+			return fmt.Errorf("pig %s references missing run %s", pig.Code, pig.RunID)
+		}
+		if run.State != StateReceiving && run.State != StateDepressurizing && run.State != StateComplete {
+			return fmt.Errorf("pig %s references run %s in state %s", pig.Code, pig.RunID, run.State)
+		}
+		if _, ok := stations[pig.ReceiveStation]; !ok {
+			return fmt.Errorf("pig %s references unknown receive station %s", pig.Code, pig.ReceiveStation)
+		}
+		pigs[pig.Code] = pig
+	}
+	chains := make(map[string][]Handover, len(pigs))
+	handoverIDs := make(map[string]string, len(s.Handovers))
+	for _, handover := range s.Handovers {
+		if err := handover.Validate(); err != nil {
+			return fmt.Errorf("handover %s: %w", handover.ID, err)
+		}
+		if other, exists := handoverIDs[handover.ID]; exists {
+			return fmt.Errorf("handover id %s is duplicated by pigs %s and %s", handover.ID, other, handover.PigCode)
+		}
+		handoverIDs[handover.ID] = handover.PigCode
+		if _, ok := pigs[handover.PigCode]; !ok {
+			return fmt.Errorf("handover %s references unregistered pig %s", handover.ID, handover.PigCode)
+		}
+		if _, ok := stations[handover.ReleaseStation]; !ok {
+			return fmt.Errorf("handover %s references unknown release station %s", handover.ID, handover.ReleaseStation)
+		}
+		if handover.Status == HandoverAccepted {
+			if _, ok := stations[handover.AcceptStation]; !ok {
+				return fmt.Errorf("handover %s references unknown accept station %s", handover.ID, handover.AcceptStation)
+			}
+			if handover.SealAnomaly != handover.SealMismatch() {
+				return fmt.Errorf("handover %s seal anomaly flag is inconsistent", handover.ID)
+			}
+		}
+		chains[handover.PigCode] = append(chains[handover.PigCode], handover)
+	}
+	for code, chain := range chains {
+		sort.Slice(chain, func(i, j int) bool { return chain[i].Sequence < chain[j].Sequence })
+		pending := 0
+		for i, handover := range chain {
+			if handover.Sequence != int64(i+1) {
+				return fmt.Errorf("pig %s handover sequence is not contiguous", code)
+			}
+			if handover.Status == HandoverPending {
+				pending++
+			}
+			if i == 0 {
+				if handover.ReleaseStation != pigs[code].ReceiveStation {
+					return fmt.Errorf("pig %s custody chain does not start at its receive station", code)
+				}
+				continue
+			}
+			prev := chain[i-1]
+			if prev.Status != HandoverAccepted {
+				return fmt.Errorf("pig %s handover sequence %d follows an unaccepted handover", code, handover.Sequence)
+			}
+			if handover.ReleaseStation != prev.AcceptStation || handover.ReleaseCrew != prev.AcceptCrew {
+				return fmt.Errorf("pig %s custody chain is broken at sequence %d", code, handover.Sequence)
+			}
+		}
+		if pending > 1 {
+			return fmt.Errorf("pig %s has more than one pending handover", code)
 		}
 	}
 	return nil

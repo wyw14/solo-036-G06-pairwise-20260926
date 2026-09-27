@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wyw14/solo-036/internal/custody"
 	"github.com/wyw14/solo-036/internal/emergency"
 	"github.com/wyw14/solo-036/internal/journal"
 	"github.com/wyw14/solo-036/internal/launcher"
@@ -511,6 +512,8 @@ func (r *Runtime) Snapshot() model.ControlSnapshot {
 		Permits:    make([]model.PermitState, 0),
 		Runs:       r.Runs.Snapshot(),
 		Incidents:  append([]model.Incident(nil), control.Incidents...),
+		Pigs:       r.Custody.Pigs(),
+		Handovers:  r.Custody.Handovers(),
 	}
 	for _, value := range control.Stations {
 		snapshot.Stations = append(snapshot.Stations, value)
@@ -565,6 +568,7 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 		return RecoveryReport{}, err
 	}
 	run.Restore(r.Runs, snapshot.Control.Runs)
+	custody.Restore(r.Custody, snapshot.Control.Pigs, snapshot.Control.Handovers)
 	leasing := make([]model.RouteLease, 0)
 	for _, routeState := range snapshot.Control.Routes {
 		if routeState.Reserved {
